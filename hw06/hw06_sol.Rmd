@@ -1,0 +1,379 @@
+---
+title: "Homework 6, due 11:59pm Sunday 3/24"
+author: "DATASCI/STATS 531"
+output:
+  html_document
+---
+
+\newcommand\prob{\mathbb{P}}
+\newcommand\E{\mathbb{E}}
+\newcommand\var{\mathrm{Var}}
+\newcommand\cov{\mathrm{Cov}}
+\newcommand\data[1]{#1^*}
+
+--------
+
+
+Please submit your homework report to Canvas, including both the Rmarkdown (.Rmd) source file and an HTML file compiled from it.  If necessary, you can submit other files needed for your Rmd file to compile, but please do not submit a copy of the data. Your Rmd file can read in the Consett measles data from the internet, via
+```{r,eval=F}
+read.csv("https://kingaa.github.io/sbied/stochsim/Measles_Consett_1948.csv") 
+```
+
+Your report should contain a reference section listing sources. The grader should be able to clearly identify where the sources were used, for example using reference numbers in the text. Anything and anyone consulted while you are working on the homework counts as a source and should be credited. The homework will be graded following the grading scheme in the [syllabus](../syllabus.html).
+
+This homework is conceptually quite simple, but involves overcoming various technical hurdles. The hurdles may be overcome quite quickly, or could turn into a longer battle. To make progress on statistical inference for POMP models, we have to solve these underlying computational issues. If technical difficulties arise, do not wait long before asking your colleagues, coming to office hours, or posting on Piazza.
+
+---------------
+
+### Installing the **pomp** package
+
+
+* Computation time is an unavoidable consideration when working with simulation-based inference, for all but small datasets and simple models. 
+
+* The **pomp** package therefore allows you to specify the most computationally intensive steps---usually, simulation of the stochastic dynamic system, and evaluation of the measurement density---as snippets of C code. 
+
+* Consequently, to use **pomp**, your R program must have access to a C compiler. In addition, **pomp** takes advantage of some Fortran code and therefore requires a Fortran compiler. 
+
+* Installing the necessary compilers should be fairly routine, but does involve an extra step beyond the usual installation of an R package, unless you are running the Linux operating system for which they are usually installed by default. Given how fundamental C and Fortran are to scientific computing, it is unfortunate that Mac and Windows do not provide these compilers by default.
+
+* Detailed instructions for installing **pomp** and other software that we will use with it are provided in the following places:
+
+    + The [pomp website installation page](https://kingaa.github.io/pomp/install.html)
+
+    + Additional instructions on our [course website](https://ionides.github.io/531w24/pomp_prep/index.html)
+
+-----------------
+
+
+### Homework questions
+
+
+**<big>Question 6.1</big>. Exploring behavior of a POMP model: simulating an SIR process.**
+
+Write a solution to Exercise 2.3 from Chapter 12 (Simulation of stochastic dynamic models). Note the following:
+
+* We are working toward formal inference for POMP models. Nevertheless, playing with your model by plotting simulations at various parameter values is a useful exercise for getting to understand how your model behaves. It is not enough to know just what parameter value maximizes the likelihood, we also want to understand enough about the model to be able to interpret this MLE. What types of behavior can the model exhibit? How could we describe the behaviors that are consistent with the data?
+
+* Your solution will have to build a copy of the measles model so that you can experiment with it. The [Chapter 12 R script](https://kingaa.github.io/sbied/stochsim/main.R) may be useful. The script uses Hadley Wickham's `tidyverse` and `ggplot` approach to R. This is a widely used approach, and well worth learning if you have not seen it before, but you may also stick with basic R. To read the script, you will need to know that `x |> myfunc(y)` is equivalent to `myfunc(x,y)`, so `|>` is simply a convenient way to chain together functions, where the output of one function is piped into the next. Check that you understand this syntax for the code 
+```{r,eval=F, warning=F, message=F}
+readr::read_csv("https://kingaa.github.io/sbied/stochsim/Measles_Consett_1948.csv") |>
+  dplyr::select(week,reports=cases) -> meas
+```
+
+* Here, we use the function `read_csv` from `readr`, which is part of `tidyverse`, in place of the basic R function `read.csv`.
+
+* Worked solutions are linked from the notes, if you get stuck. Ideally, you may like to look at them after solving the homework independently. Your solution is welcome to discuss the relationship between your investigation of the model and the posted solutions. 
+
+* Another example of building a pomp model is the [Ricker model](https://kingaa.github.io/sbied/intro/ricker.html), originally developed to model fish populations and used in this example to model a bird population.
+
+* Various other tutorials and resources are available on the [pomp package web site](https://kingaa.github.io/pomp/docs.html).
+
+----------
+
+**<big>Question 6.2</big>. Modifying a POMP model: Adding a latent period to the SIR model**
+
+Write a solution to Exercise 2.4 from Chapter 12 (Simulation of stochastic dynamic models).
+
+You should use Csnippets for this. It should not require techniques beyond those developed in Chapter 12. However, if you are interested in learning more about writing compiled C code for R, you can look at the [R extensions manual](https://cran.r-project.org/doc/manuals/r-release/R-exts.html). The section on [distribution functions](https://cran.r-project.org/doc/manuals/r-release/R-exts.html#Distribution-functions) is particularly relevant.
+
+----------
+
+### Homework Soltion Begins Here 
+
+```{r libraries, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(doFuture)
+library(pomp)
+library(cowplot)
+set.seed(2488820)
+plan(multisession)
+```
+
+**<big>Solution 6.1</big>
+
+```{r, read_data, message=FALSE}
+read_csv(paste0("https://kingaa.github.io/sbied/stochsim/",
+                "Measles_Consett_1948.csv")) |>
+  select(week,reports=cases) -> meas
+meas |> as.data.frame() |> head()
+```
+
+```{r initial_plot}
+meas |>
+  ggplot(aes(x=week,y=reports)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Weekly Measles Data",
+       y = "Reports",
+       x = "Week")
+```
+
+Things to note:
+
+- *reports* variable represents the number of new measles cases in a given week
+- we will model the outbreak using a SIR model
+- first, we need to estimate the parameters of the SIR model
+- then evaluate whether or not the model is appropriate
+- we're assuming the population size is fixes, **N = 38,000**
+
+```{r}
+sir_step <- function (S, I, R, N, Beta, mu_IR, delta.t, ...)
+{
+  dN_SI <- rbinom(n=1,size=S,prob=1-exp(-Beta*I/N*delta.t))
+  dN_IR <- rbinom(n=1,size=I,prob=1-exp(-mu_IR*delta.t))
+  S <- S - dN_SI
+  I <- I + dN_SI - dN_IR
+  R <- R + dN_IR
+  c(S = S, I = I, R = R)
+}
+
+# At day zero, I = 1
+
+sir_rinit <- function (N, eta, ...) {
+  c(S = round(N*eta), I = 1, R = round(N*(1-eta)))
+}
+
+# Fold model components into pomp object 
+
+meas |>
+  pomp(times="week",t0=0,
+    rprocess=euler(sir_step,delta.t=1/7),
+    rinit=sir_rinit
+  ) -> measSIR
+```
+
+```{r}
+sir_step <- Csnippet("
+  double dN_SI = rbinom(S,1-exp(-Beta*I/N*dt));
+  double dN_IR = rbinom(I,1-exp(-mu_IR*dt));
+  S -= dN_SI;
+  I += dN_SI - dN_IR;
+  R += dN_IR;
+  H += dN_IR;
+")
+
+sir_rinit <- Csnippet("
+  S = nearbyint(eta*N);
+  I = 1;
+  R = nearbyint((1-eta)*N);
+  H = 0;
+")
+
+sir_dmeas <- Csnippet("
+  lik = dnbinom_mu(reports,k,rho*H,give_log);
+")
+
+sir_rmeas <- Csnippet("
+  reports = rnbinom_mu(k,rho*H);
+")
+
+measSIR |>
+  pomp(rprocess=euler(sir_step,delta.t=1/7),
+    rinit=sir_rinit,
+    rmeasure=sir_rmeas,
+    dmeasure=sir_dmeas,
+    accumvars="H",
+    statenames=c("S","I","R","H"),
+    paramnames=c("Beta","mu_IR","N","eta","rho","k")
+  ) -> measSIR
+```
+
+### Parameters
+
+- `Beta`: transmission rate
+- `mu_IR`: rate at which individuals in I transition to R 
+- `rho`: probability at which cases are reported
+- `k`: controls the variance of the distribution, the larger k is, the more similar it is to a Poisson Dist. 
+- `eta`: fraction of how many people are susceptible
+
+```{r}
+measSIR |>
+  simulate(
+    params=c(Beta=7.5,mu_IR=0.5,rho=0.5,k=10,
+      eta=0.03,N=38000),
+    nsim=20,format="data.frame",include.data=TRUE
+) -> sims
+
+sims |>
+  ggplot(aes(x=week,y=reports,group=.id,color=.id=="data"))+
+  geom_line()+
+  guides(color="none")
+```
+
+The twenty simulations are in red. It's obvious that we need to do some parameter tweaking to make this an adequate model. First we'll explore how making changes to each individual parameter value effects the simulations. 
+
+Starting with $\beta$, we increase the parameter value by 10 in each iteration.
+
+```{r, messing_w_beta}
+gg_list <- list("p.1", "p.2", "p.3", "p.4")
+sims_list <- list("sims.1", "sims.2", "sims.3", "sims.4")
+
+for (x in 1:4) {
+  measSIR |>
+  simulate(
+    params=c(Beta=7.5 + x*10,mu_IR=0.5,rho=.5,k=10,
+      eta=0.03,N=38000),
+    nsim=20,format="data.frame",include.data=TRUE
+  ) -> sims_list[[x]]
+  
+  sims_list[[x]] |>
+    ggplot(aes(x=week,y=reports,group=.id,color=.id=="data"))+
+    geom_line()+
+    guides(color="none") -> gg_list[[x]]
+}
+
+plot_grid(gg_list[[1]], gg_list[[2]], gg_list[[3]], gg_list[[4]], 
+          labels = c("Beta = 17.5", "Beta = 27.5", "Beta = 37.5", "Beta = 47.5" ),
+          label_size = 12)
+```
+
+In this example, we increase $\mu_{IR}$ by 0.1 in each iteration. Notice that we also increased $\beta$ to 47.5, but fixed it through the loop. As we increase the rate that individuals transition from I to R, the number of reported cases decreases. However, the length of the outbreak does not change. 
+
+```{r, messing_with_mu}
+for (x in 1:4) {
+  measSIR |>
+  simulate(
+    params=c(Beta=47.5,mu_IR=0.5 + x/10,rho=.5,k=10,
+      eta=0.03,N=38000),
+    nsim=20,format="data.frame",include.data=TRUE
+  ) -> sims_list[[x]]
+  
+  sims_list[[x]] |>
+    ggplot(aes(x=week,y=reports,group=.id,color=.id=="data"))+
+    geom_line()+
+    guides(color="none") -> gg_list[[x]]
+}
+
+plot_grid(gg_list[[1]], gg_list[[2]], gg_list[[3]], gg_list[[4]], 
+          labels = c("mu_IR = 0.6", "mu_IR = 0.7", "mu_IR = 0.8", "mu_IR = 0.9" ),
+          label_size = 12)
+```
+
+Here, we keep $\beta = 47.5$ and let $\rho \in (0.2,0.4,0.6,0.8)$. $\rho$ represents the probability that an individual case gets reported. So, the higher the rate, the more reported cases we expect to see, which is reflected in the simulations below. 
+
+```{r, messing_with_rho}
+rho_vec <- c(0.2, 0.4, 0.6, 0.8)
+
+for (x in 1:4) {
+  measSIR |>
+  simulate(
+    params=c(Beta=47.5,mu_IR=0.5,rho=rho_vec[[x]], k=10,
+      eta=0.03,N=38000),
+    nsim=20,format="data.frame",include.data=TRUE
+  ) -> sims_list[[x]]
+  
+  sims_list[[x]] |>
+    ggplot(aes(x=week,y=reports,group=.id,color=.id=="data"))+
+    geom_line()+
+    guides(color="none") -> gg_list[[x]]
+}
+
+plot_grid(gg_list[[1]], gg_list[[2]], gg_list[[3]], gg_list[[4]], 
+          labels = c("rho = 0.2", "rho = 0.4", "rho = 0.6", "rho = 0.8" ),
+          label_size = 12)
+```
+
+Lastly, we tweak the $\eta$ parameter. This is the most sensitive of all the parameters, which makes sense as it denotes the fraction of people that are susceptible. Increasing $\eta$ increases both the duration and the number of reported cases of the simulated measles outbreak. 
+
+```{r, messing_with_eta}
+eta_vec <- c(0.03, 0.075, 0.1, 0.125)
+
+for (x in 1:4) {
+  measSIR |>
+  simulate(
+    params=c(Beta=7.5,mu_IR=0.5,rho=0.5, k=10,
+      eta=eta_vec[[x]],N=38000),
+    nsim=20,format="data.frame",include.data=TRUE
+  ) -> sims_list[[x]]
+  
+  sims_list[[x]] |>
+    ggplot(aes(x=week,y=reports,group=.id,color=.id=="data"))+
+    geom_line()+
+    guides(color="none") -> gg_list[[x]]
+}
+
+plot_grid(gg_list[[1]], gg_list[[2]], gg_list[[3]], gg_list[[4]], 
+          labels = c("eta = 0.03", "eta = 0.075", "eta = 0.1", "eta = 0.125" ),
+          label_size = 12)
+```
+
+```{r}
+measSIR |>
+  simulate(
+    params=c(Beta=25,mu_IR=0.2,rho=0.5,k=10,
+      eta=0.03,N=38000),
+    nsim=20,format="data.frame",include.data=TRUE
+) -> sims
+
+sims |>
+  ggplot(aes(x=week,y=reports,group=.id,color=.id=="data"))+
+  geom_line()+
+  guides(color="none")
+```
+
+Leveraging what we learned from parameter tweaking, we can get something that's passable.
+
+**<big>Solution 6.1</big>**
+
+Below, we modify the code to transform to a SEIR model. In a SEIR model, infected individuals must pass a period of latency before becoming infectious. We introduce a new parameter $\mu_{EI}$, the rate at which an individual transitions from E to I. From a quick Google search, the incubation period of measles is 8-10 days, which roughly translates to $\mu_{EI} = 0.8$. Setting the rest of the parameters as follows:
+
+- `Beta` = 60
+- `mu_IR` = 0.8
+- `rho` = 0.8
+- `k` = 10
+- `eta` = 0.028
+
+gives pretty good results. 
+
+```{r, seir_pomp}
+seir_step <- Csnippet("
+  double dN_SE = rbinom(S,1-exp(-Beta*I/N*dt));
+  double dN_EI = rbinom(E,1-exp(-mu_EI*dt));
+  double dN_IR = rbinom(I,1-exp(-mu_IR*dt));
+  S -= dN_SE;
+  E += dN_SE - dN_EI;
+  I += dN_EI - dN_IR;
+  R += dN_IR;
+  H += dN_IR;
+")
+
+
+seir_init <- Csnippet("
+  S = nearbyint(eta*N);
+  E = 0;
+  I = 1;
+  R = nearbyint((1-eta)*N);
+  H = 0;
+")
+
+measSIR |>
+  pomp(
+    rprocess=euler(seir_step,delta.t=1/7),
+    rinit=seir_init,
+    paramnames=c("N","Beta","mu_EI","mu_IR","rho","eta"),
+    statenames=c("S","E","I","R","H")
+  ) -> measSEIR
+```
+
+```{r, seir_sim}
+measSEIR |>
+  simulate(params=c(Beta=60,mu_EI=0.8,mu_IR=.9,rho=0.8,k=10,eta=0.028,N=38000),
+    nsim=20,format="data.frame",include.data=TRUE) |>
+  ggplot(aes(x=week,y=reports,group=.id,color=.id=="data"))+
+  geom_line()+
+  guides(color="none")
+```
+
+**Note:** I went to office hours and got advice/feedback from Jesse on the parameter loops. He suggested using `cowplot` - thanks, Jesse! Besides that, I worked through the slides and checked my answers with the old solutions.  
+
+----------
+
+### Acknowledgements
+
+The questions derive from material in a short course on [Simulation-based Inference for Epidemiological Dynamics](http://kingaa.github.io/sbied/index.html)
+
+---------------
+
+
+
+
